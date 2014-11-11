@@ -504,7 +504,7 @@ decode.ip = function (raw_packet, offset) {
     ret.flags.reserved = (raw_packet[offset + 6] & 128) >> 7;
     ret.flags.df = (raw_packet[offset + 6] & 64) >> 6;
     ret.flags.mf = (raw_packet[offset + 6] & 32) >> 5;
-    ret.fragment_offset = ((raw_packet[offset + 6] & 31) * 256) + raw_packet[offset + 7]; // 13-bits from 6, 7
+    ret.fragment_offset = (((raw_packet[offset + 6] & 31) * 256) + raw_packet[offset + 7]) * 8; // 13-bits from 6, 7
     ret.ttl = raw_packet[offset + 8];
     ret.protocol = raw_packet[offset + 9];
     ret.header_checksum = unpack.uint16(raw_packet, offset + 10); // 10, 11
@@ -527,11 +527,23 @@ decode.ip = function (raw_packet, offset) {
         break;
     case 17:
         ret.protocol_name = "UDP";
-        ret.udp = decode.udp(raw_packet, offset + (ret.header_length * 4));
+        // Only decode UDP if not fragmented
+        if (ret.flags.mf === 0 && ret.fragment_offset === 0) {
+            ret.udp = decode.udp(raw_packet, offset + (ret.header_length * 4),
+                                 ret.total_length - (ret.header_length * 4));
+        }
         break;
     default:
         ret.protocol_name = "Unknown";
     }
+
+    // Decode IP fragments
+    if (ret.flags.mf === 1 || ret.fragment_offset > 0) {
+        ret.protocol_name += " fragment";
+        ret.fragment = decode.ip_fragment(raw_packet, offset + (ret.header_length * 4),
+                                          ret.total_length - (ret.header_length * 4));
+    }
+
     return ret;
 };
 
@@ -743,7 +755,24 @@ decode.igmp = function (raw_packet, offset) {
     return ret;
 };
 
-decode.udp = function (raw_packet, offset) {
+decode.ip_fragment = function (raw_packet, offset, ip_data_length) {
+    var ret = {};
+
+    ret.data_offset = offset;
+    ret.data_end    = offset + ip_data_length;
+    ret.data_bytes  = ip_data_length;
+
+    // Follow tcp pattern and don't make a copy of the data payload
+    // Therefore its only valid for this pass throught the capture loop
+    if (ret.data_bytes > 0) {
+        ret.data = raw_packet.slice(ret.data_offset, ret.data_end);
+        ret.data.length = ret.data_bytes;
+    }
+
+    return ret;
+};
+
+decode.udp = function (raw_packet, offset, ip_data_length) {
     var ret = {};
 
     // http://en.wikipedia.org/wiki/User_Datagram_Protocol
@@ -759,8 +788,13 @@ decode.udp = function (raw_packet, offset) {
     // Follow tcp pattern and don't make a copy of the data payload
     // Therefore its only valid for this pass throught the capture loop
     if (ret.data_bytes > 0) {
-        ret.data = raw_packet.slice(ret.data_offset, ret.data_end);
-        ret.data.length = ret.data_bytes;
+        var adjust = 0;
+        if (ret.data_bytes > ip_data_length) {
+            adjust = ret.data_bytes - ip_data_length + 8;
+            ret.remain_frag = adjust;
+        }
+        ret.data = raw_packet.slice(ret.data_offset, ret.data_end - adjust);
+        ret.data.length = ret.data_bytes - adjust;
     }
 
     if (ret.sport === 53 || ret.dport === 53) {
